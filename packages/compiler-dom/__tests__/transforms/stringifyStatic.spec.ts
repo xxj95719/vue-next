@@ -161,10 +161,10 @@ describe('stringify static html', () => {
 
   test('should bail on runtime constant v-bind bindings', () => {
     const { ast } = compile(
-      `<div><div><img src="./foo" />${repeat(
+      `<div><div>${repeat(
         `<span class="foo">foo</span>`,
         StringifyThresholds.ELEMENT_WITH_BINDING_COUNT
-      )}</div></div>`,
+      )}<img src="./foo" /></div></div>`,
       {
         hoistStatic: true,
         prefixIdentifiers: true,
@@ -222,6 +222,43 @@ describe('stringify static html', () => {
     )
     expect(ast2.hoists.length).toBe(1)
     expect(ast2.hoists[0]).toMatchObject({
+      type: NodeTypes.VNODE_CALL // not CALL_EXPRESSION
+    })
+  })
+
+  test('should bail on non attribute bindings', () => {
+    const { ast } = compileWithStringify(
+      `<div><div>${repeat(
+        `<span class="foo">foo</span>`,
+        StringifyThresholds.ELEMENT_WITH_BINDING_COUNT
+      )}<input indeterminate></div></div>`
+    )
+    expect(ast.hoists.length).toBe(1)
+    expect(ast.hoists[0]).toMatchObject({
+      type: NodeTypes.VNODE_CALL // not CALL_EXPRESSION
+    })
+
+    const { ast: ast2 } = compileWithStringify(
+      `<div><div>${repeat(
+        `<span class="foo">foo</span>`,
+        StringifyThresholds.ELEMENT_WITH_BINDING_COUNT
+      )}<input :indeterminate="true"></div></div>`
+    )
+    expect(ast2.hoists.length).toBe(1)
+    expect(ast2.hoists[0]).toMatchObject({
+      type: NodeTypes.VNODE_CALL // not CALL_EXPRESSION
+    })
+  })
+
+  test('should bail on break content with innerHTML (eg.tables related tags)', () => {
+    const { ast } = compileWithStringify(
+      `<table><tbody>${repeat(
+        `<tr class="foo"><td>foo</td></tr>`,
+        StringifyThresholds.ELEMENT_WITH_BINDING_COUNT
+      )}</tbody></table>`
+    )
+    expect(ast.hoists.length).toBe(1)
+    expect(ast.hoists[0]).toMatchObject({
       type: NodeTypes.VNODE_CALL // not CALL_EXPRESSION
     })
   })

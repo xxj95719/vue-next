@@ -25,7 +25,8 @@ import {
   toDisplayString,
   normalizeClass,
   normalizeStyle,
-  stringifyStyle
+  stringifyStyle,
+  makeMap
 } from '@vue/shared'
 
 export const enum StringifyThresholds {
@@ -33,10 +34,10 @@ export const enum StringifyThresholds {
   NODE_COUNT = 20
 }
 
-type StringiableNode = PlainElementNode | TextCallNode
+type StringifiableNode = PlainElementNode | TextCallNode
 
 /**
- * Turn eligible hoisted static trees into stringied static nodes, e.g.
+ * Turn eligible hoisted static trees into stringified static nodes, e.g.
  *
  * ```js
  * const _hoisted_1 = createStaticVNode(`<div class="foo">bar</div>`)
@@ -61,7 +62,7 @@ type StringiableNode = PlainElementNode | TextCallNode
 export const stringifyStatic: HoistTransform = (children, context) => {
   let nc = 0 // current node count
   let ec = 0 // current element with binding count
-  const currentChunk: StringiableNode[] = []
+  const currentChunk: StringifiableNode[] = []
 
   const stringifyCurrentChunk = (currentIndex: number): number => {
     if (
@@ -101,7 +102,7 @@ export const stringifyStatic: HoistTransform = (children, context) => {
     const hoisted = getHoistedNode(child)
     if (hoisted) {
       // presence of hoisted means child must be a stringifiable node
-      const node = child as StringiableNode
+      const node = child as StringifiableNode
       const result = analyzeNode(node)
       if (result) {
         // node is stringifiable, record state
@@ -137,13 +138,15 @@ const isStringifiableAttr = (name: string) => {
 }
 
 const replaceHoist = (
-  node: StringiableNode,
+  node: StringifiableNode,
   replacement: JSChildNode | null,
   context: TransformContext
 ) => {
   const hoistToReplace = (node.codegenNode as SimpleExpressionNode).hoisted!
   context.hoists[context.hoists.indexOf(hoistToReplace)] = replacement
 }
+
+const isNonStringifiable = /*#__PURE__*/ makeMap(`thead,tr,th,tbody,td`)
 
 /**
  * for a hoisted node, analyze it and return:
@@ -152,7 +155,11 @@ const replaceHoist = (
  *   - nc is the number of nodes inside
  *   - ec is the number of element with bindings inside
  */
-function analyzeNode(node: StringiableNode): [number, number] | false {
+function analyzeNode(node: StringifiableNode): [number, number] | false {
+  if (node.type === NodeTypes.ELEMENT && isNonStringifiable(node.tag)) {
+    return false
+  }
+
   if (node.type === NodeTypes.TEXT_CALL) {
     return [1, 0]
   }
@@ -185,31 +192,14 @@ function analyzeNode(node: StringiableNode): [number, number] | false {
         ) {
           return bail()
         }
-        // some transforms, e.g. `transformAssetUrls` in `@vue/compiler-sfc` may
-        // convert static attributes into a v-bind with a constnat expresion.
-        // Such constant bindings are eligible for hoisting but not for static
-        // stringification because they cannot be pre-evaluated.
-        if (
-          p.exp &&
-          (p.exp.type === NodeTypes.COMPOUND_EXPRESSION ||
-            p.exp.isRuntimeConstant)
-        ) {
-          return bail()
-        }
       }
     }
     for (let i = 0; i < node.children.length; i++) {
       nc++
-      if (nc >= StringifyThresholds.NODE_COUNT) {
-        return true
-      }
       const child = node.children[i]
       if (child.type === NodeTypes.ELEMENT) {
         if (child.props.length > 0) {
           ec++
-          if (ec >= StringifyThresholds.ELEMENT_WITH_BINDING_COUNT) {
-            return true
-          }
         }
         walk(child)
         if (bailed) {

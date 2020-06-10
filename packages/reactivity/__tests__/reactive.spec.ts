@@ -1,11 +1,5 @@
 import { ref, isRef } from '../src/ref'
-import {
-  reactive,
-  isReactive,
-  toRaw,
-  markRaw,
-  shallowReactive
-} from '../src/reactive'
+import { reactive, isReactive, toRaw, markRaw } from '../src/reactive'
 import { mockWarn } from '@vue/shared'
 import { computed } from '../src/computed'
 
@@ -174,18 +168,5 @@ describe('reactivity/reactive', () => {
       foo: Object.freeze({ a: 1 })
     })
     expect(isReactive(obj.foo)).toBe(false)
-  })
-
-  describe('shallowReactive', () => {
-    test('should not make non-reactive properties reactive', () => {
-      const props = shallowReactive({ n: { foo: 1 } })
-      expect(isReactive(props.n)).toBe(false)
-    })
-
-    test('should keep reactive properties reactive', () => {
-      const props: any = shallowReactive({ n: reactive({ foo: 1 }) })
-      props.n = reactive({ foo: 2 })
-      expect(isReactive(props.n)).toBe(true)
-    })
   })
 })
