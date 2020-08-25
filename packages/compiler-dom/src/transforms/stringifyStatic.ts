@@ -59,7 +59,15 @@ type StringifiableNode = PlainElementNode | TextCallNode
  *
  * This optimization is only performed in Node.js.
  */
-export const stringifyStatic: HoistTransform = (children, context) => {
+export const stringifyStatic: HoistTransform = (children, context, parent) => {
+  if (
+    parent.type === NodeTypes.ELEMENT &&
+    (parent.tagType === ElementTypes.COMPONENT ||
+      parent.tagType === ElementTypes.TEMPLATE)
+  ) {
+    return
+  }
+
   let nc = 0 // current node count
   let ec = 0 // current element with binding count
   const currentChunk: StringifiableNode[] = []
@@ -146,7 +154,9 @@ const replaceHoist = (
   context.hoists[context.hoists.indexOf(hoistToReplace)] = replacement
 }
 
-const isNonStringifiable = /*#__PURE__*/ makeMap(`thead,tr,th,tbody,td`)
+const isNonStringifiable = /*#__PURE__*/ makeMap(
+  `caption,thead,tr,th,tbody,td,tfoot,colgroup,col`
+)
 
 /**
  * for a hoisted node, analyze it and return:

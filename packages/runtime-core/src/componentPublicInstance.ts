@@ -1,13 +1,22 @@
 import { ComponentInternalInstance, Data } from './component'
 import { nextTick, queueJob } from './scheduler'
 import { instanceWatch } from './apiWatch'
-import { EMPTY_OBJ, hasOwn, isGloballyWhitelisted, NOOP } from '@vue/shared'
+import {
+  EMPTY_OBJ,
+  hasOwn,
+  isGloballyWhitelisted,
+  NOOP,
+  extend,
+  isString
+} from '@vue/shared'
 import {
   ReactiveEffect,
-  UnwrapRef,
   toRaw,
   shallowReadonly,
-  ReactiveFlags
+  ReactiveFlags,
+  track,
+  TrackOpTypes,
+  ShallowUnwrapRef
 } from '@vue/reactivity'
 import {
   ExtractComputedReturns,
@@ -17,7 +26,8 @@ import {
   ComponentOptionsMixin,
   OptionTypesType,
   OptionTypesKeys,
-  resolveMergedOptions
+  resolveMergedOptions,
+  isInBeforeCreate
 } from './componentOptions'
 import { normalizePropsOptions } from './componentProps'
 import { EmitsOptions, EmitFn } from './componentEmits'
@@ -91,6 +101,15 @@ type UnwrapMixinsType<
 
 type EnsureNonVoid<T> = T extends void ? {} : T
 
+export type ComponentPublicInstanceConstructor<
+  T extends ComponentPublicInstance = ComponentPublicInstance<any>
+> = {
+  __isFragment?: never
+  __isTeleport?: never
+  __isSuspense?: never
+  new (...args: any[]): T
+}
+
 export type CreateComponentPublicInstance<
   P = {},
   B = {},
@@ -146,22 +165,15 @@ export type ComponentPublicInstance<
   $nextTick: typeof nextTick
   $watch: typeof instanceWatch
 } & P &
-  UnwrapRef<B> &
+  ShallowUnwrapRef<B> &
   D &
   ExtractComputedReturns<C> &
   M &
   ComponentCustomProperties
 
-export type ComponentPublicInstanceConstructor<
-  T extends ComponentPublicInstance
-> = {
-  new (): T
-}
+type PublicPropertiesMap = Record<string, (i: ComponentInternalInstance) => any>
 
-const publicPropertiesMap: Record<
-  string,
-  (i: ComponentInternalInstance) => any
-> = {
+const publicPropertiesMap: PublicPropertiesMap = extend(Object.create(null), {
   $: i => i,
   $el: i => i.vnode.el,
   $data: i => i.data,
@@ -172,11 +184,11 @@ const publicPropertiesMap: Record<
   $parent: i => i.parent && i.parent.proxy,
   $root: i => i.root && i.root.proxy,
   $emit: i => i.emit,
-  $options: i => (__FEATURE_OPTIONS__ ? resolveMergedOptions(i) : i.type),
+  $options: i => (__FEATURE_OPTIONS_API__ ? resolveMergedOptions(i) : i.type),
   $forceUpdate: i => () => queueJob(i.update),
   $nextTick: () => nextTick,
-  $watch: __FEATURE_OPTIONS__ ? i => instanceWatch.bind(i) : NOOP
-}
+  $watch: i => (__FEATURE_OPTIONS_API__ ? instanceWatch.bind(i) : NOOP)
+} as PublicPropertiesMap)
 
 const enum AccessTypes {
   SETUP,
@@ -203,8 +215,8 @@ export const PublicInstanceProxyHandlers: ProxyHandler<any> = {
       appContext
     } = instance
 
-    // let @vue/reatvitiy know it should never observe Vue public instances.
-    if (key === ReactiveFlags.skip) {
+    // let @vue/reactivity know it should never observe Vue public instances.
+    if (key === ReactiveFlags.SKIP) {
       return true
     }
 
@@ -214,6 +226,7 @@ export const PublicInstanceProxyHandlers: ProxyHandler<any> = {
     // is the multiple hasOwn() calls. It's much faster to do a simple property
     // access on a plain object, so we use an accessCache object (with null
     // prototype) to memoize what access type a key corresponds to.
+    let normalizedProps
     if (key[0] !== '$') {
       const n = accessCache![key]
       if (n !== undefined) {
@@ -237,15 +250,15 @@ export const PublicInstanceProxyHandlers: ProxyHandler<any> = {
       } else if (
         // only cache other properties when instance has declared (thus stable)
         // props
-        type.props &&
-        hasOwn(normalizePropsOptions(type)[0]!, key)
+        (normalizedProps = normalizePropsOptions(type)[0]) &&
+        hasOwn(normalizedProps, key)
       ) {
         accessCache![key] = AccessTypes.PROPS
         return props![key]
       } else if (ctx !== EMPTY_OBJ && hasOwn(ctx, key)) {
         accessCache![key] = AccessTypes.CONTEXT
         return ctx[key]
-      } else {
+      } else if (!__FEATURE_OPTIONS_API__ || !isInBeforeCreate) {
         accessCache![key] = AccessTypes.OTHER
       }
     }
@@ -254,8 +267,9 @@ export const PublicInstanceProxyHandlers: ProxyHandler<any> = {
     let cssModule, globalProperties
     // public $xxx properties
     if (publicGetter) {
-      if (__DEV__ && key === '$attrs') {
-        markAttrsAccessed()
+      if (key === '$attrs') {
+        track(instance, TrackOpTypes.GET, key)
+        __DEV__ && markAttrsAccessed()
       }
       return publicGetter(instance)
     } else if (
@@ -277,9 +291,10 @@ export const PublicInstanceProxyHandlers: ProxyHandler<any> = {
     } else if (
       __DEV__ &&
       currentRenderingInstance &&
-      // #1091 avoid internal isRef/isVNode checks on component instance leading
-      // to infinite warning loop
-      key.indexOf('__v') !== 0
+      (!isString(key) ||
+        // #1091 avoid internal isRef/isVNode checks on component instance leading
+        // to infinite warning loop
+        key.indexOf('__v') !== 0)
     ) {
       if (data !== EMPTY_OBJ && key[0] === '$' && hasOwn(data, key)) {
         warn(
@@ -343,11 +358,13 @@ export const PublicInstanceProxyHandlers: ProxyHandler<any> = {
     }: ComponentRenderContext,
     key: string
   ) {
+    let normalizedProps
     return (
       accessCache![key] !== undefined ||
       (data !== EMPTY_OBJ && hasOwn(data, key)) ||
       (setupState !== EMPTY_OBJ && hasOwn(setupState, key)) ||
-      (type.props && hasOwn(normalizePropsOptions(type)[0]!, key)) ||
+      ((normalizedProps = normalizePropsOptions(type)[0]) &&
+        hasOwn(normalizedProps, key)) ||
       hasOwn(ctx, key) ||
       hasOwn(publicPropertiesMap, key) ||
       hasOwn(appContext.config.globalProperties, key)
@@ -365,27 +382,30 @@ if (__DEV__ && !__TEST__) {
   }
 }
 
-export const RuntimeCompiledPublicInstanceProxyHandlers = {
-  ...PublicInstanceProxyHandlers,
-  get(target: ComponentRenderContext, key: string) {
-    // fast path for unscopables when using `with` block
-    if ((key as any) === Symbol.unscopables) {
-      return
+export const RuntimeCompiledPublicInstanceProxyHandlers = extend(
+  {},
+  PublicInstanceProxyHandlers,
+  {
+    get(target: ComponentRenderContext, key: string) {
+      // fast path for unscopables when using `with` block
+      if ((key as any) === Symbol.unscopables) {
+        return
+      }
+      return PublicInstanceProxyHandlers.get!(target, key, target)
+    },
+    has(_: ComponentRenderContext, key: string) {
+      const has = key[0] !== '_' && !isGloballyWhitelisted(key)
+      if (__DEV__ && !has && PublicInstanceProxyHandlers.has!(_, key)) {
+        warn(
+          `Property ${JSON.stringify(
+            key
+          )} should not start with _ which is a reserved prefix for Vue internals.`
+        )
+      }
+      return has
     }
-    return PublicInstanceProxyHandlers.get!(target, key, target)
-  },
-  has(_: ComponentRenderContext, key: string) {
-    const has = key[0] !== '_' && !isGloballyWhitelisted(key)
-    if (__DEV__ && !has && PublicInstanceProxyHandlers.has!(_, key)) {
-      warn(
-        `Property ${JSON.stringify(
-          key
-        )} should not start with _ which is a reserved prefix for Vue internals.`
-      )
-    }
-    return has
   }
-}
+)
 
 // In dev mode, the proxy target exposes the same properties as seen on `this`
 // for easier console inspection. In prod mode it will be an empty object so

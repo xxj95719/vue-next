@@ -1,4 +1,9 @@
-import { toRaw, shallowReactive } from '@vue/reactivity'
+import {
+  toRaw,
+  shallowReactive,
+  trigger,
+  TriggerOpTypes
+} from '@vue/reactivity'
 import {
   EMPTY_OBJ,
   camelize,
@@ -14,14 +19,15 @@ import {
   makeMap,
   isReservedProp,
   EMPTY_ARR,
-  def
+  def,
+  extend
 } from '@vue/shared'
 import { warn } from './warning'
 import {
   Data,
   ComponentInternalInstance,
   ComponentOptions,
-  Component
+  ConcreteComponent
 } from './component'
 import { isEmitListener } from './componentEmits'
 import { InternalObjectKey } from './vnode'
@@ -34,14 +40,14 @@ export type ComponentObjectPropsOptions<P = Data> = {
   [K in keyof P]: Prop<P[K]> | null
 }
 
-export type Prop<T> = PropOptions<T> | PropType<T>
+export type Prop<T, D = T> = PropOptions<T, D> | PropType<T>
 
-type DefaultFactory<T> = () => T | null | undefined
+type DefaultFactory<T> = (props: Data) => T | null | undefined
 
-interface PropOptions<T = any> {
+interface PropOptions<T = any, D = T> {
   type?: PropType<T> | true | null
   required?: boolean
-  default?: T | DefaultFactory<T> | null | undefined
+  default?: D | DefaultFactory<D> | null | undefined | object
   validator?(value: unknown): boolean
 }
 
@@ -52,8 +58,8 @@ type PropConstructor<T = any> =
   | { (): T }
   | PropMethod<T>
 
-type PropMethod<T> = T extends (...args: any) => any // if is function with args
-  ? { new (): T; (): T; readonly proptotype: Function } // Create Function like constructor
+type PropMethod<T, TConstructor = any> = T extends (...args: any) => any // if is function with args
+  ? { new (): TConstructor; (): T; readonly prototype: TConstructor } // Create Function like constructor
   : never
 
 type RequiredKeys<T, MakeDefaultRequired> = {
@@ -74,10 +80,10 @@ type InferPropType<T> = T extends null
   : T extends { type: null | true }
     ? any // As TS issue https://github.com/Microsoft/TypeScript/issues/14829 // somehow `ObjectConstructor` when inferred from { (): T } becomes `any` // `BooleanConstructor` when inferred from PropConstructor(with PropMethod) becomes `Boolean`
     : T extends ObjectConstructor | { type: ObjectConstructor }
-      ? { [key: string]: any }
+      ? Record<string, any>
       : T extends BooleanConstructor | { type: BooleanConstructor }
         ? boolean
-        : T extends Prop<infer V> ? V : T
+        : T extends Prop<infer V, infer D> ? (unknown extends V ? D : V) : T
 
 export type ExtractPropTypes<
   O,
@@ -147,7 +153,12 @@ export function updateProps(
   const rawCurrentProps = toRaw(props)
   const [options] = normalizePropsOptions(instance.type)
 
-  if ((optimized || patchFlag > 0) && !(patchFlag & PatchFlags.FULL_PROPS)) {
+  if (
+    // always force full diff if hmr is enabled
+    !(__DEV__ && instance.type.__hmrId) &&
+    (optimized || patchFlag > 0) &&
+    !(patchFlag & PatchFlags.FULL_PROPS)
+  ) {
     if (patchFlag & PatchFlags.PROPS) {
       // Compiler-generated props & no keys change, just set the updated
       // the props.
@@ -184,13 +195,20 @@ export function updateProps(
     for (const key in rawCurrentProps) {
       if (
         !rawProps ||
+        // for camelCase
         (!hasOwn(rawProps, key) &&
           // it's possible the original props was passed in as kebab-case
           // and converted to camelCase (#955)
           ((kebabKey = hyphenate(key)) === key || !hasOwn(rawProps, kebabKey)))
       ) {
         if (options) {
-          if (rawPrevProps && rawPrevProps[kebabKey!] !== undefined) {
+          if (
+            rawPrevProps &&
+            // for camelCase
+            (rawPrevProps[key] !== undefined ||
+              // for kebab-case
+              rawPrevProps[kebabKey!] !== undefined)
+          ) {
             props[key] = resolvePropValue(
               options,
               rawProps || EMPTY_OBJ,
@@ -214,6 +232,9 @@ export function updateProps(
     }
   }
 
+  // trigger updates for $attrs in case it's used in component slots
+  trigger(instance, TriggerOpTypes.SET, '$attrs')
+
   if (__DEV__ && rawProps) {
     validateProps(props, instance.type)
   }
@@ -226,8 +247,6 @@ function setFullProps(
   attrs: Data
 ) {
   const [options, needCastKeys] = normalizePropsOptions(instance.type)
-  const emits = instance.type.emits
-
   if (rawProps) {
     for (const key in rawProps) {
       const value = rawProps[key]
@@ -240,7 +259,7 @@ function setFullProps(
       let camelKey
       if (options && hasOwn(options, (camelKey = camelize(key)))) {
         props[camelKey] = value
-      } else if (!emits || !isEmitListener(emits, key)) {
+      } else if (!isEmitListener(instance.type, key)) {
         // Any non-declared (either as a prop or an emitted event) props are put
         // into a separate `attrs` object for spreading. Make sure to preserve
         // original key casing
@@ -275,7 +294,10 @@ function resolvePropValue(
     // default values
     if (hasDefault && value === undefined) {
       const defaultValue = opt.default
-      value = isFunction(defaultValue) ? defaultValue() : defaultValue
+      value =
+        opt.type !== Function && isFunction(defaultValue)
+          ? defaultValue(props)
+          : defaultValue
     }
     // boolean casting
     if (opt[BooleanFlags.shouldCast]) {
@@ -293,7 +315,7 @@ function resolvePropValue(
 }
 
 export function normalizePropsOptions(
-  comp: Component
+  comp: ConcreteComponent
 ): NormalizedPropsOptions | [] {
   if (comp.__props) {
     return comp.__props
@@ -305,10 +327,10 @@ export function normalizePropsOptions(
 
   // apply mixin/extends props
   let hasExtends = false
-  if (__FEATURE_OPTIONS__ && !isFunction(comp)) {
+  if (__FEATURE_OPTIONS_API__ && !isFunction(comp)) {
     const extendProps = (raw: ComponentOptions) => {
       const [props, keys] = normalizePropsOptions(raw)
-      Object.assign(normalized, props)
+      extend(normalized, props)
       if (keys) needCastKeys.push(...keys)
     }
     if (comp.extends) {
@@ -394,7 +416,7 @@ function getTypeIndex(
 /**
  * dev only
  */
-function validateProps(props: Data, comp: Component) {
+function validateProps(props: Data, comp: ConcreteComponent) {
   const rawValues = toRaw(props)
   const options = normalizePropsOptions(comp)[0]
   for (const key in options) {
@@ -480,7 +502,7 @@ function assertType(value: unknown, type: PropConstructor): AssertionResult {
       valid = value instanceof type
     }
   } else if (expectedType === 'Object') {
-    valid = toRawType(value) === 'Object'
+    valid = isObject(value)
   } else if (expectedType === 'Array') {
     valid = isArray(value)
   } else {
